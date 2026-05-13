@@ -76,7 +76,6 @@ def crop_to_nonzero(data, seg=None):
                           bbox[1][0]:bbox[1][1],
                           bbox[2][0]:bbox[2][1]]
         # 裁剪区域外的体素标记为 -1（忽略标签）
-        seg_old = cropped_seg.copy()
         cropped_seg[~mask[bbox[0][0]:bbox[0][1],
                           bbox[1][0]:bbox[1][1],
                           bbox[2][0]:bbox[2][1]]] = -1

@@ -255,8 +255,8 @@ class StentDataset(Dataset):
 
         ## 将数据pad到 (128,128,128)
         # print(type(np.min(cropped_gt)))
-        cropped_gt = self.pad_to_target_size(cropped_gt, (128,128,128), padding_value=0)
-        cropped_train = self.pad_to_target_size(cropped_train,(128,128,128), padding_value=np.min(cropped_train))
+        cropped_gt = self.pad_to_target_size(cropped_gt, self.patch_size, padding_value=0)
+        cropped_train = self.pad_to_target_size(cropped_train, self.patch_size, padding_value=np.min(cropped_train))
 
         cropped_train = np.expand_dims(cropped_train,axis=0)
         cropped_gt = np.expand_dims(cropped_gt,axis=0)

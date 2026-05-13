@@ -43,7 +43,7 @@ class AnisotropicAttention(nn.Module):
         self.se = nn.Sequential(
             nn.AdaptiveAvgPool3d(1),
             nn.Conv3d(fusion_in, reduced, kernel_size=1),
-            nn.ReLU(),
+            nn.LeakyReLU(negative_slope=1e-2, inplace=True),
             nn.Conv3d(reduced, in_channels, kernel_size=1),
             nn.Sigmoid(),
         )

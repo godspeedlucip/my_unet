@@ -32,7 +32,6 @@ class AnisoStentUNet(nn.Module):
         self.aniso_attn = AnisotropicAttention(in_channels)
         self.backbone = backbone_unet
         self.tub_enh = TubularEnhancement(num_classes)
-        self.deep_supervision = getattr(backbone_unet, 'deep_supervision', False)
 
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, List[torch.Tensor]]:
         x = self.aniso_attn(x)
@@ -44,3 +43,33 @@ class AnisoStentUNet(nn.Module):
             return out
 
         return self.tub_enh(out)
+
+
+class _PartialAnisoUNet(nn.Module):
+    """按需组合 AnisotropicAttention 和/或 TubularEnhancement 的轻量包装器。
+
+    与 AnisoStentUNet 不同，这个包装器允许单独使用:
+      - --aniso_attn   → 仅前置各向异性注意力
+      - --tub_enh      → 仅后置管状结构增强
+      - 两者同时使用   → 等效于 AnisoStentUNet
+
+    所有模块都有残差连接，学不到有用信息时退化为恒等变换。
+    """
+
+    def __init__(self, backbone, in_channels, num_classes,
+                 aniso_attn=True, tub_enh=True):
+        super().__init__()
+        self.backbone = backbone
+        self.aniso_attn = AnisotropicAttention(in_channels) if aniso_attn else None
+        self.tub_enh = TubularEnhancement(num_classes) if tub_enh else None
+
+    def forward(self, x):
+        if self.aniso_attn is not None:
+            x = self.aniso_attn(x)
+        out = self.backbone(x)
+        if self.tub_enh is not None:
+            if isinstance(out, list):
+                out[0] = self.tub_enh(out[0])
+                return out
+            return self.tub_enh(out)
+        return out

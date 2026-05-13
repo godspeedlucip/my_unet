@@ -15,7 +15,7 @@ nnUNet 网络扩展模块集合。
 
 from .anisotropic_attention import AnisotropicAttention
 from .tubular_enhancement import TubularEnhancement
-from .aniso_stent_unet import AnisoStentUNet
+from .aniso_stent_unet import AnisoStentUNet, _PartialAnisoUNet
 from .projection_consistency import (
     build_rotation_matrix_3d,
     differentiable_forward_projection,

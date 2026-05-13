@@ -15,14 +15,18 @@ from torch.utils.tensorboard import SummaryWriter
 
 # ====== 引入网络 & 损失 ======
 from unet3d import UNet3D
-from network_modules import AnisoStentUNet, AnisotropicAttention, TubularEnhancement
+from network_modules import AnisoStentUNet, _PartialAnisoUNet
 import tifffile as tiff
 import nibabel as nib
-import tigre
+try:
+    import tigre
+except ImportError:
+    tigre = None
 from loss import CombinedLoss
 
 
 def dice_score(preds, targets, threshold=0.5, eps=1e-6):
+    preds = torch.sigmoid(preds)
     preds = (preds > threshold).float()
     intersection = (preds * targets).sum()
     return (2.0 * intersection + eps) / (preds.sum() + targets.sum() + eps)
@@ -64,7 +68,7 @@ def load_volume(data_path, device="cuda", patch_size=(128,128,128)):
         padding_value=np.min(data))
 
     tensor = torch.from_numpy(data_pad).float().unsqueeze(0).unsqueeze(0)
-    return tensor.to(device), affine, header, data_pad.shape
+    return tensor.to(device), affine, header, data.shape
 
 
 def sliding_window_inference(model, volume, patch_size=(128,128,128), thred=0.5):
@@ -112,67 +116,37 @@ def sliding_window_inference(model, volume, patch_size=(128,128,128), thred=0.5)
             for x in x_starts:
                 patch = volume[:, :, z:z+pd, y:y+ph, x:x+pw]
                 with torch.no_grad():
-                    pred = torch.sigmoid(model(patch))
+                    pred = model(patch)
                 output[:, :, z:z+pd, y:y+ph, x:x+pw] += pred * gauss
                 weight[:, :, z:z+pd, y:y+ph, x:x+pw] += gauss
 
     output = output / weight.clamp(min=1e-8)
-    mask = (output > thred).float()
-    return mask
-    # Lets create a geometry object
+    return output
+
+
+def set_geo():
+    """创建 TIGRE cone-beam CT 几何配置。"""
+    if tigre is None:
+        raise ImportError("tigre 库未安装，无法创建几何配置。请安装: pip install tigre")
     geo = tigre.geometry()
-    # VARIABLE                                   DESCRIPTION                    UNITS
-    # -------------------------------------------------------------------------------------
-    # Distances
-    geo.DSD = 1250  # Distance Source Detector      (mm)
-    geo.DSO = 750  # Distance Source Origin        (mm)
-    # Detector parameters
-    geo.nDetector = np.array([512,512])  # number of pixels              (px)
-    geo.dDetector = np.array([0.2, 0.2])  # size of each pixel            (mm)
-    geo.sDetector = geo.nDetector * geo.dDetector  # total size of the detector    (mm)
-    # Image parameters
-    geo.nVoxel = np.array([256, 128, 128])  # number of voxels              (vx)
-    geo.dVoxel = np.array([0.2, 0.2, 0.2])  # size of each voxel            (mm)
-    geo.sVoxel = geo.dVoxel * geo.nVoxel  # total size of the image       (mm)
-    
-    # Offsets
-    geo.offOrigin = np.array([0, 0, 0])  # Offset of image from origin   (mm)
-    # geo.offOrigin = geo.sVoxel /2 
-
-    geo.offDetector = np.array([0, 0])  # Offset of Detector            (mm)
-    # geo.offDetector = geo.sDetector / 2
-
-    geo.accuracy = 0.5  # Variable to define accuracy of
-    geo.COR = 0  # y direction displacement for
-    geo.rotDetector = np.array([0, 0, 0])  # Rotation of the detector, by
-    # geo.mode = "cone"  # Or 'parallel'. Geometry type.
-    geo.mode = "cone"  # Or 'parallel'. Geometry type.
+    geo.DSD = 1250
+    geo.DSO = 750
+    geo.nDetector = np.array([512, 512])
+    geo.dDetector = np.array([0.2, 0.2])
+    geo.sDetector = geo.nDetector * geo.dDetector
+    geo.nVoxel = np.array([256, 128, 128])
+    geo.dVoxel = np.array([0.2, 0.2, 0.2])
+    geo.sVoxel = geo.dVoxel * geo.nVoxel
+    geo.offOrigin = np.array([0, 0, 0])
+    geo.offDetector = np.array([0, 0])
+    geo.accuracy = 0.5
+    geo.COR = 0
+    geo.rotDetector = np.array([0, 0, 0])
+    geo.mode = "cone"
     return geo
 
 
-geo = set_geo()
-angles = np.linspace(0,np.pi*2,360)
-
-class _PartialAnisoUNet(nn.Module):
-    """按需组合 AnisotropicAttention 和/或 TubularEnhancement 的轻量包装器（推理用）。"""
-
-    def __init__(self, backbone, in_channels, num_classes,
-                 aniso_attn=True, tub_enh=True):
-        super().__init__()
-        self.backbone = backbone
-        self.aniso_attn = AnisotropicAttention(in_channels) if aniso_attn else None
-        self.tub_enh = TubularEnhancement(num_classes) if tub_enh else None
-
-    def forward(self, x):
-        if self.aniso_attn is not None:
-            x = self.aniso_attn(x)
-        out = self.backbone(x)
-        if self.tub_enh is not None:
-            if isinstance(out, list):
-                out[0] = self.tub_enh(out[0])
-                return out
-            return self.tub_enh(out)
-        return out
+geo = None  # 延迟初始化，仅在需要 TIGRE 投影时调用 set_geo()
 
 
 # ====== 测试函数 ======
@@ -256,8 +230,9 @@ def test_model(model_path, data_path, gt_path, work_name, save_path, thred=0.5,
         data_files = sorted(os.listdir(data_path))
         file_pairs = [(f, f) for f in data_files]
 
-    geo = set_geo()
-    angles = np.linspace(0, np.pi * 2, 360)
+    if if_project:
+        geo = set_geo()
+        angles = np.linspace(0, np.pi * 2, 360)
 
     total_loss = 0
     total_dice = 0
@@ -266,28 +241,30 @@ def test_model(model_path, data_path, gt_path, work_name, save_path, thred=0.5,
         for data_file, gt_file in tqdm(file_pairs, desc="推理中"):
             if is_nifti:
                 # 加载完整 volume → 滑窗推理
-                vol, _, _, padded_shape = load_volume(
+                vol, _, _, orig_shape = load_volume(
                     join(data_path, data_file), device=device,
                     patch_size=patch_size)
                 gt_vol, gt_affine, gt_header, _ = load_volume(
                     join(gt_path, gt_file), device=device,
                     patch_size=patch_size)
 
-                mask = sliding_window_inference(
+                logits = sliding_window_inference(
                     model, vol, patch_size=patch_size, thred=thred)
 
                 # 裁剪回原始尺寸 (去掉 padding)
-                gt_data = gt_vol[:, :, :gt_vol.shape[2], :gt_vol.shape[3], :gt_vol.shape[4]]
-                mask_out = mask[:, :, :mask.shape[2], :mask.shape[3], :mask.shape[4]]
+                d, h, w = orig_shape
+                gt_data = gt_vol[:, :, :d, :h, :w]
+                logits_cropped = logits[:, :, :d, :h, :w]
 
                 # 保存为 .nii.gz
+                mask_out = (torch.sigmoid(logits_cropped) > thred).float()
                 out_name = data_file.replace('_0000.nii.gz', '_pred.nii.gz').replace('.nii.gz', '_pred.nii.gz')
                 nib.save(nib.Nifti1Image(
                     mask_out[0, 0].cpu().numpy().astype(np.float32),
                     gt_affine, gt_header), join(vol_save_path, out_name))
 
-                loss = criterion(mask_out, gt_data)
-                dice = dice_score(mask_out, gt_data)
+                loss = criterion(logits_cropped, gt_data)
+                dice = dice_score(logits_cropped, gt_data)
             else:
                 # tif 格式: 原始逻辑
                 train_data = np.expand_dims(tiff.imread(join(data_path, data_file)), axis=0)
@@ -297,13 +274,13 @@ def test_model(model_path, data_path, gt_path, work_name, save_path, thred=0.5,
                 gt_data = np.expand_dims(gt_data, axis=0)
                 gt_data = torch.tensor(gt_data).float().to(device)
 
-                output = torch.sigmoid(model(train_data))
-                mask = (output > thred)
+                output = model(train_data)
 
-                loss = criterion(mask.float(), gt_data)
-                dice = dice_score(mask.float(), gt_data)
+                loss = criterion(output, gt_data)
+                dice = dice_score(output, gt_data)
 
-                output_cpu = mask[0].cpu().numpy().squeeze()
+                mask_out = (torch.sigmoid(output) > thred)
+                output_cpu = mask_out[0].cpu().numpy().squeeze()
                 tiff.imwrite(join(vol_save_path, data_file), output_cpu.astype(np.float32))
 
             total_loss += loss.item()
@@ -312,7 +289,7 @@ def test_model(model_path, data_path, gt_path, work_name, save_path, thred=0.5,
 
             if if_project:
                 proj = tigre.Ax(
-                    mask[0, 0].cpu().numpy().squeeze().astype(np.float32),
+                    mask_out[0, 0].cpu().numpy().squeeze().astype(np.float32),
                     geo, angles)
                 tiff.imwrite(join(proj_save_path, data_file), proj)
 

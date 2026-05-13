@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-import torch.nn.functional as F
 from load_data import StentDataset, StentDatasetV2
 from augmentation import get_default_augmentation
 import numpy as np
@@ -19,13 +18,12 @@ from unet3d import UNet3D, UNetPlusPlus3D
 from loss import CombinedLoss
 from network_modules import (
     AnisoStentUNet,
-    AnisotropicAttention,
-    TubularEnhancement,
     ProjectionConsistencyLoss,
     CombinedSegProjLoss,
     GenSurfLoss,
     CombinedDTMLoss,
     get_dtm,
+    _PartialAnisoUNet,
 )
 import time
 
@@ -52,50 +50,35 @@ def dice_score(preds, targets, threshold=0.5, eps=1e-6):
     intersection = (preds * targets).sum()
     return (2.0 * intersection + eps) / (preds.sum() + targets.sum() + eps)
 
-def save_checkpoint(epoch, model, optimizer, save_path):
-    torch.save({
+def save_checkpoint(epoch, model, optimizer, save_path, grad_scaler=None):
+    state = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict()
-    }, save_path)
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    if grad_scaler is not None:
+        state['grad_scaler_state_dict'] = grad_scaler.state_dict()
+    torch.save(state, save_path)
 
-def resume_model(checkpoint_path,model,optimizer,device):
+def resume_model(checkpoint_path, model, optimizer, device, grad_scaler=None):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    start_epoch = checkpoint['epoch'] + 1 # 从下一轮开始
+
+    try:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    except (ValueError, KeyError) as e:
+        print(f"WARNING: Could not load optimizer state ({e}). "
+              f"Starting with fresh optimizer (lr={optimizer.param_groups[0]['lr']}).")
+
+    if grad_scaler is not None and 'grad_scaler_state_dict' in checkpoint:
+        try:
+            grad_scaler.load_state_dict(checkpoint['grad_scaler_state_dict'])
+        except Exception:
+            print("WARNING: Could not load grad_scaler state. Starting with fresh scaler.")
+
+    start_epoch = checkpoint['epoch'] + 1
     print(f"Resuming training from epoch {start_epoch}")
-    return model,optimizer,start_epoch
-
-class _PartialAnisoUNet(nn.Module):
-    """按需组合 AnisotropicAttention 和/或 TubularEnhancement 的轻量包装器。
-
-    与 AnisoStentUNet 不同，这个包装器允许单独使用:
-      - --aniso_attn   → 仅前置各向异性注意力
-      - --tub_enh      → 仅后置管状结构增强
-      - 两者同时使用   → 等效于 AnisoStentUNet
-
-    所有模块都有残差连接，学不到有用信息时退化为恒等变换。
-    """
-
-    def __init__(self, backbone, in_channels, num_classes,
-                 aniso_attn=True, tub_enh=True):
-        super().__init__()
-        self.backbone = backbone
-        self.aniso_attn = AnisotropicAttention(in_channels) if aniso_attn else None
-        self.tub_enh = TubularEnhancement(num_classes) if tub_enh else None
-
-    def forward(self, x):
-        if self.aniso_attn is not None:
-            x = self.aniso_attn(x)
-        out = self.backbone(x)
-        if self.tub_enh is not None:
-            if isinstance(out, list):
-                out[0] = self.tub_enh(out[0])
-                return out
-            return self.tub_enh(out)
-        return out
-
+    return model, optimizer, start_epoch
 
 def _build_partial_aniso(backbone, aniso_attn=False, tub_enh=False):
     """构建 PartialAnisoUNet 并打印配置。"""
@@ -116,11 +99,35 @@ def compute_dtm_for_batch(seg_batch, voxel_spacing=(1.0, 1.0, 1.0)):
     for i in range(seg_batch.shape[0]):
         seg_np = seg_batch[i, 0].cpu().numpy().astype(np.int16)
         dtm_np = get_dtm(seg_np, voxel_spacing=voxel_spacing, label_list=[0, 1])
-        dtm_tensor = torch.from_numpy(dtm_np[..., 1:2].copy()).float()
-        dtm_list.append(dtm_tensor.permute(2, 0, 1).unsqueeze(0))  # (D,H,W,1) → (1,1,D,H,W)
+        dtm_tensor = torch.from_numpy(dtm_np[..., 1].copy()).float()  # (D, H, W)
+        dtm_list.append(dtm_tensor.unsqueeze(0).unsqueeze(0))         # (1, 1, D, H, W)
     return torch.cat(dtm_list, dim=0)
 
 # ====== 训练循环 ======
+def _apply_gpu_transforms(images, segs, transform):
+    """Apply per-sample transforms on GPU tensors.
+
+    Running SpatialTransform (grid_sample) on CPU for 128³ 3D volumes
+    is extremely slow. This function applies transforms on already-GPU
+    tensors, which is 10-50x faster for spatial ops.
+
+    Transforms expect (C, D, H, W) format (no batch dim), so we squeeze
+    each sample before passing and restore the batch dim afterward.
+    """
+    aug_imgs, aug_segs = [], []
+    with torch.no_grad():
+        for i in range(images.shape[0]):
+            d = transform(**{'image': images[i], 'segmentation': segs[i]})
+            aug_imgs.append(d['image'].unsqueeze(0))
+            seg_out = d['segmentation']
+            if seg_out.ndim == 3:
+                seg_out = seg_out.unsqueeze(0)
+            if seg_out.ndim == 4:
+                seg_out = seg_out.unsqueeze(0)
+            aug_segs.append(seg_out)
+    return torch.cat(aug_imgs, dim=0), torch.cat(aug_segs, dim=0)
+
+
 def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
                  preprocessed_dir=None, save_dir='./output', batch_size=16,
                  lr=1e-2, device="cuda", checkpoint_path=None,
@@ -131,10 +138,11 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
                  proj_weight=0.1, proj_angles="0,90",
                  dtm_loss=False, dtm_weight=0.5, dtm_warmup=250,
                  num_iterations_per_epoch=250):
-    # Reduce CPU thread contention during GPU training
+    # CUDA performance optimizations
     if device == "cuda":
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
+        torch.backends.cudnn.benchmark = True
     # 数据集划分：训练 / 验证 / 测试
     # proj_dir = '/data/liuyang/stent/DTR/data/120_120'
     save_path = join(save_dir,work_name)
@@ -148,6 +156,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
         f.write(log_line)
 
     patch_size = (128, 128, 128)
+    train_transform = None  # will be set below if augmentation is enabled
 
     if preprocessed_dir is not None:
         # 使用预处理后的 .npy 数据（快速路径）
@@ -161,6 +170,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
         assert proj_path is not None and gt_path is not None, \
             "需要提供 --data_path 和 --gt_path，或 --preprocessed_dir"
         dataset = StentDataset(proj_path, gt_path, patch_size=patch_size)
+        train_transform = get_default_augmentation('train', patch_size=patch_size) if use_augmentation else None
 
     train_size = int(0.9 * len(dataset))  # 选多一点的数据来训练
     val_size = len(dataset) - train_size
@@ -169,25 +179,25 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
         dataset, [train_size, val_size, test_size]
     )
 
-    # 如果使用新数据管线，用 Subset 为 train/val 分别设置不同的 transform
+    # 如果使用新数据管线，用 Subset 为 train/val 划分数据
+    # 增强在 GPU 上应用（不在 DataLoader worker 中，避免 CPU grid_sample 瓶颈）
     if preprocessed_dir is not None:
         train_indices = train_dataset.indices
         val_indices = val_dataset.indices
 
         train_transform = get_default_augmentation('train', patch_size=patch_size) if use_augmentation else None
-        val_transform = get_default_augmentation('val', patch_size=patch_size)
 
         train_dataset = torch.utils.data.Subset(
             StentDatasetV2(
                 preprocessed_dir, patch_size=patch_size,
-                oversample_foreground_prob=0.33, transform=train_transform
+                oversample_foreground_prob=0.33, transform=None
             ),
             train_indices
         )
         val_dataset = torch.utils.data.Subset(
             StentDatasetV2(
                 preprocessed_dir, patch_size=patch_size,
-                oversample_foreground_prob=0.33, transform=val_transform
+                oversample_foreground_prob=0.33, transform=None
             ),
             val_indices
         )
@@ -214,7 +224,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
         print(f"Using AnisoStentUNet (AnisoAttn + {arch.upper()} + TubEnh)")
     elif aniso_attn or tub_enh:
         model = _build_partial_aniso(backbone.to(device), aniso_attn=aniso_attn,
-                                     tub_enh=tub_enh)
+                                     tub_enh=tub_enh).to(device)
     else:
         model = backbone.to(device)
         print(f"Using {arch.upper()}")
@@ -255,7 +265,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
 
     start_epoch = 0
     if checkpoint_path is not None:
-        model, optimizer, start_epoch = resume_model(checkpoint_path, model, optimizer, device)
+        model, optimizer, start_epoch = resume_model(checkpoint_path, model, optimizer, device, grad_scaler)
 
     # --- 训练 & 验证 ---
     best_val_dice = -1.0
@@ -277,6 +287,11 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
 
             inputs = inputs.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
+
+            # GPU augmentation — grid_sample on GPU is 10-50x faster than CPU
+            if train_transform is not None:
+                inputs, targets = _apply_gpu_transforms(inputs, targets, train_transform)
+
             optimizer.zero_grad(set_to_none=True)
 
             if grad_scaler is not None:
@@ -286,6 +301,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
                         dtm_batch = compute_dtm_for_batch(targets).to(device)
                         total, l_seg, l_gsl, alpha = criterion(
                             outputs, targets, dtm_batch, None, epoch)
+                        train_gsl += l_gsl.item()
                     else:
                         total = criterion(outputs, targets)
                 grad_scaler.scale(total).backward()
@@ -313,7 +329,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
         avg_train_loss = train_loss / max(train_iter, 1)
         avg_train_dice = train_dice / max(train_iter, 1)
 
-        save_checkpoint(epoch, model, optimizer,
+        save_checkpoint(epoch, model, optimizer, grad_scaler=grad_scaler, save_path=
                         os.path.join(model_save_path, "checkpoint_latest.pth"))
 
         # --- 验证阶段 (固定迭代次数) ---
@@ -364,7 +380,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
 
         if avg_val_dice > best_val_dice:
             best_val_dice = avg_val_dice
-            save_checkpoint(epoch, model, optimizer,
+            save_checkpoint(epoch, model, optimizer, grad_scaler=grad_scaler, save_path=
                             os.path.join(model_save_path, "checkpoint_best.pth"))
 
         end_time = time.time()
@@ -393,7 +409,7 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
                 log_line = f"{epoch+1},{avg_train_loss:.4f},{avg_train_dice:.4f},{avg_val_loss:.4f},{avg_val_dice:.4f},{consume_times:.2f}\n"
                 f.write(log_line)
 
-    save_checkpoint(epoch, model, optimizer,
+    save_checkpoint(epoch, model, optimizer, grad_scaler=grad_scaler, save_path=
                     os.path.join(model_save_path, "checkpoint_final.pth"))
     writer.close() # 关闭tensorboard
 

@@ -232,6 +232,9 @@ class SpatialTransform(BasicTransform):
             grid[..., d] /= (spatial_shape[d] / 2.0) if spatial_shape[d] > 0 else 1.0
         grid = torch.flip(grid, (-1,))  # (D,H,W,3) → (D,H,W,z,y,x)
 
+        # Move grid to tensor device (GPU) before grid_sample
+        grid = grid.to(tensor.device)
+
         return grid_sample(
             tensor[None], grid[None],
             mode=mode, padding_mode=padding_mode, align_corners=False
@@ -307,7 +310,8 @@ class GaussianNoiseTransform(ImageOnlyTransform):
         ch_indices = torch.where(params['apply_to_channel'])[0]
         spatial_shape = (1, *img.shape[1:])
         for idx, ch in enumerate(ch_indices):
-            noise = torch.normal(0, params['sigmas'][idx], size=spatial_shape)
+            noise = torch.normal(0, params['sigmas'][idx], size=spatial_shape,
+                                 device=img.device)
             img[ch] += noise[0]
         return img
 
