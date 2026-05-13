@@ -1,0 +1,35 @@
+# 硬件配置
+device: "cuda"
+cuda_visible_devices: "2"
+
+# 路径配置
+paths:
+  data_path: "/path/to/your/test_data"
+  gt_path: "/path/to/your/ground_truth"
+  model_path: "/path/to/your/checkpoint.pth"
+  save_dir: "./results"
+  work_name: "experiment_01"
+
+# 几何参数 (TIGRE)
+geometry:
+  DSD: 1250
+  DSO: 750
+  nDetector: [512, 512]
+  dDetector: [0.2, 0.2]
+  nVoxel: [256, 128, 128]
+  dVoxel: [0.2, 0.2, 0.2]
+  offOrigin: [0, 0, 0]
+  offDetector: [0, 0]
+  accuracy: 0.5
+  COR: 0
+  rotDetector: [0, 0, 0]
+  mode: "cone"
+  angles_num: 360
+
+# 模型与推理参数
+inference:
+  thred: 0.5
+  if_project: false
+  base_channels: 8
+  dice_weight: 1.0
+  lap_weight: 0.1
