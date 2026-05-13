@@ -4,18 +4,18 @@ import torch.nn.functional as F
 
 
 class ConvBlock3D(nn.Module):
-    """3x3x3 Conv + BN + ReLU"""
+    """3x3x3 Conv + InstanceNorm + LeakyReLU"""
     def __init__(self, in_channels, out_channels):
         super(ConvBlock3D, self).__init__()
         self.conv = nn.Sequential(
             nn.Conv3d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True),
+            nn.InstanceNorm3d(out_channels),
+            nn.LeakyReLU(negative_slope=1e-2, inplace=True),
             nn.Conv3d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm3d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.InstanceNorm3d(out_channels),
+            nn.LeakyReLU(negative_slope=1e-2, inplace=True),
         )
-        
+
     def forward(self, x):
         return self.conv(x)
 

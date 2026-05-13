@@ -30,6 +30,21 @@ from network_modules import (
 import time
 
 
+class PolyLRScheduler:
+    """Poly learning rate scheduler, identical to nnUNet's polylr."""
+    def __init__(self, optimizer, initial_lr, num_epochs, exponent=0.9):
+        self.optimizer = optimizer
+        self.initial_lr = initial_lr
+        self.num_epochs = num_epochs
+        self.exponent = exponent
+
+    def step(self, epoch):
+        lr = self.initial_lr * (1 - epoch / self.num_epochs) ** self.exponent
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        return lr
+
+
 # ====== Dice指标 ======
 def dice_score(preds, targets, threshold=0.5, eps=1e-6):
     preds = torch.sigmoid(preds)
@@ -108,13 +123,18 @@ def compute_dtm_for_batch(seg_batch, voxel_spacing=(1.0, 1.0, 1.0)):
 # ====== 训练循环 ======
 def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
                  preprocessed_dir=None, save_dir='./output', batch_size=16,
-                 lr=1e-4, device="cuda", checkpoint_path=None,
+                 lr=1e-2, device="cuda", checkpoint_path=None,
                  num_workers=4, use_augmentation=False,
                  arch="unet3d", aniso_stent=False,
                  aniso_attn=False, tub_enh=False,
                  proj_consistency=False,
                  proj_weight=0.1, proj_angles="0,90",
-                 dtm_loss=False, dtm_weight=0.5, dtm_warmup=250):
+                 dtm_loss=False, dtm_weight=0.5, dtm_warmup=250,
+                 num_iterations_per_epoch=250):
+    # Reduce CPU thread contention during GPU training
+    if device == "cuda":
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
     # 数据集划分：训练 / 验证 / 测试
     # proj_dir = '/data/liuyang/stent/DTR/data/120_120'
     save_path = join(save_dir,work_name)
@@ -172,32 +192,40 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
             val_indices
         )
 
-    # DataLoader
+    # DataLoader — use cyclic sampling to match nnUNet fixed-iterations paradigm
     print(f"epochs={num_epochs} work={work_name} preprocessed={preprocessed_dir} "
           f"batch={batch_size} lr={lr} device={device} workers={num_workers} "
-          f"aug={use_augmentation} checkpoint={checkpoint_path}")
+          f"aug={use_augmentation} checkpoint={checkpoint_path} "
+          f"iters_per_epoch={num_iterations_per_epoch}")
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=(device == "cuda"))
+                              num_workers=num_workers, pin_memory=(device == "cuda"),
+                              drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=(device == "cuda"))
 
-    # 模型 — 支持三种独立的前/后处理模块组合
+    # --- 模型 ---
     if arch == "unetpp":
         backbone = UNetPlusPlus3D(in_channels=1, out_channels=1, base_channels=8)
     else:
         backbone = UNet3D(in_channels=1, out_channels=1, base_channels=8)
 
     if aniso_stent:
-        # 完整包装：AnisoAttn 前置 + TubEnh 后置（残差保证退化安全）
         model = AnisoStentUNet(backbone, in_channels=1, num_classes=1).to(device)
         print(f"Using AnisoStentUNet (AnisoAttn + {arch.upper()} + TubEnh)")
     elif aniso_attn or tub_enh:
-        # 单独使用各向异性注意力或管状增强
         model = _build_partial_aniso(backbone.to(device), aniso_attn=aniso_attn,
                                      tub_enh=tub_enh)
     else:
         model = backbone.to(device)
         print(f"Using {arch.upper()}")
+
+    # torch.compile for free speedup (auto-disabled on Windows/CPU)
+    if device == "cuda" and hasattr(torch, 'compile'):
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("torch.compile enabled (mode=reduce-overhead)")
+        except Exception as e:
+            print(f"torch.compile failed ({e}), continuing without it")
 
     seg_loss = CombinedLoss(dice_weight=1.0, lap_weight=0.1).to(device)
     if proj_consistency:
@@ -217,75 +245,116 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
         print(f"Using CombinedDTMLoss (weight={dtm_weight}, warmup={dtm_warmup})")
     else:
         criterion = seg_loss
-    optimizer = optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
+
+    # SGD + Nesterov momentum (like nnUNet) — much less VRAM than Adam
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.99,
+                          weight_decay=3e-5, nesterov=True)
+    scheduler = PolyLRScheduler(optimizer, lr, num_epochs, exponent=0.9)
+    grad_scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
     # best_loss = 1e+20
 
     start_epoch = 0
-    if(checkpoint_path is not None):
-        model,optimizer,start_epoch = resume_model(checkpoint_path,model,optimizer,device)
+    if checkpoint_path is not None:
+        model, optimizer, start_epoch = resume_model(checkpoint_path, model, optimizer, device)
 
-    # 训练 & 验证
+    # --- 训练 & 验证 ---
     best_val_dice = -1.0
     print('start training...')
-    pbar = tqdm(range(start_epoch,num_epochs),desc='Epoch: ')
+    pbar = tqdm(range(start_epoch, num_epochs), desc='Epoch: ')
     for epoch in pbar:
-        pbar.set_description(f"Epoch {epoch+1}/{num_epochs}") #正确显示进度
+        pbar.set_description(f"Epoch {epoch+1}/{num_epochs}")
         start_time = time.time()
+        current_lr = scheduler.step(epoch)
 
-        # --- 训练阶段 ---
+        # --- 训练阶段 (固定迭代次数, 对标 nnUNet) ---
         model.train()
         train_loss, train_dice = 0.0, 0.0
-        train_gsl = 0.0  # DTM GenSurfLoss tracking
+        train_gsl = 0.0
+        train_iter = 0
         for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
-            outputs = model(inputs)
+            if train_iter >= num_iterations_per_epoch:
+                break
 
-            if dtm_loss:
-                dtm_batch = compute_dtm_for_batch(targets).to(device)
-                total, l_seg, l_gsl, alpha = criterion(
-                    outputs, targets, dtm_batch, None, epoch)
-                total.backward()
-                optimizer.step()
-                train_loss += total.item()
-                train_gsl += l_gsl.item()
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+
+            if grad_scaler is not None:
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    if dtm_loss:
+                        dtm_batch = compute_dtm_for_batch(targets).to(device)
+                        total, l_seg, l_gsl, alpha = criterion(
+                            outputs, targets, dtm_batch, None, epoch)
+                    else:
+                        total = criterion(outputs, targets)
+                grad_scaler.scale(total).backward()
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
             else:
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item()
-
-            train_dice += dice_score(outputs, targets).item()
-
-        avg_train_loss = train_loss / len(train_loader)
-        avg_train_dice = train_dice / len(train_loader)
-
-        save_checkpoint(epoch, model, optimizer,
-                        os.path.join(model_save_path, "checkpoint_latest.pth"))
-
-        # --- 验证阶段 ---
-        model.eval()
-        val_loss, val_dice = 0.0, 0.0
-        val_gsl = 0.0
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
-
                 if dtm_loss:
                     dtm_batch = compute_dtm_for_batch(targets).to(device)
                     total, l_seg, l_gsl, alpha = criterion(
                         outputs, targets, dtm_batch, None, epoch)
-                    val_loss += total.item()
-                    val_gsl += l_gsl.item()
+                    train_gsl += l_gsl.item()
                 else:
-                    loss = criterion(outputs, targets)
-                    val_loss += loss.item()
+                    total = criterion(outputs, targets)
+                total.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=12)
+                optimizer.step()
 
+            train_loss += total.item()
+            train_dice += dice_score(outputs, targets).item()
+            train_iter += 1
+
+        avg_train_loss = train_loss / max(train_iter, 1)
+        avg_train_dice = train_dice / max(train_iter, 1)
+
+        save_checkpoint(epoch, model, optimizer,
+                        os.path.join(model_save_path, "checkpoint_latest.pth"))
+
+        # --- 验证阶段 (固定迭代次数) ---
+        model.eval()
+        val_loss, val_dice = 0.0, 0.0
+        val_gsl = 0.0
+        val_iter = 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                if val_iter >= num_iterations_per_epoch // 5:
+                    break
+
+                inputs = inputs.to(device, non_blocking=True)
+                targets = targets.to(device, non_blocking=True)
+
+                if grad_scaler is not None:
+                    with torch.cuda.amp.autocast():
+                        outputs = model(inputs)
+                        if dtm_loss:
+                            dtm_batch = compute_dtm_for_batch(targets).to(device)
+                            total, l_seg, l_gsl, alpha = criterion(
+                                outputs, targets, dtm_batch, None, epoch)
+                            val_gsl += l_gsl.item()
+                        else:
+                            total = criterion(outputs, targets)
+                else:
+                    outputs = model(inputs)
+                    if dtm_loss:
+                        dtm_batch = compute_dtm_for_batch(targets).to(device)
+                        total, l_seg, l_gsl, alpha = criterion(
+                            outputs, targets, dtm_batch, None, epoch)
+                        val_gsl += l_gsl.item()
+                    else:
+                        total = criterion(outputs, targets)
+
+                val_loss += total.item()
                 val_dice += dice_score(outputs, targets).item()
+                val_iter += 1
 
-        avg_val_loss = val_loss / len(val_loader)
-        avg_val_dice = val_dice / len(val_loader)
+        avg_val_loss = val_loss / max(val_iter, 1)
+        avg_val_dice = val_dice / max(val_iter, 1)
 
         # 第一个参数是标签，第二个是值，第三个是步数（这里用epoch）
         writer.add_scalar('val/loss', avg_val_loss, epoch)
@@ -302,9 +371,9 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
         consume_times = end_time-start_time
 
         if dtm_loss:
-            avg_train_gsl = train_gsl / len(train_loader)
-            avg_val_gsl = val_gsl / len(val_loader)
-            print(f"Epoch [{epoch+1}/{num_epochs}] "
+            avg_train_gsl = train_gsl / max(train_iter, 1)
+            avg_val_gsl = val_gsl / max(val_iter, 1)
+            print(f"Epoch [{epoch+1}/{num_epochs}] LR={current_lr:.2e} "
                   f"Train Loss: {avg_train_loss:.4f} | Train Dice: {avg_train_dice:.4f} "
                   f"| Train GSL: {avg_train_gsl:.4f} "
                   f"| Val Loss: {avg_val_loss:.4f} | Val Dice: {avg_val_dice:.4f} "
@@ -314,10 +383,9 @@ def train_model(num_epochs, work_name, proj_path=None, gt_path=None,
                 log_line = f"{epoch+1},{avg_train_loss:.4f},{avg_train_dice:.4f},{avg_train_gsl:.4f},{avg_val_loss:.4f},{avg_val_dice:.4f},{avg_val_gsl:.4f},{consume_times:.2f}\n"
                 f.write(log_line)
         else:
-            print(f"Epoch [{epoch+1}/{num_epochs}] "
+            print(f"Epoch [{epoch+1}/{num_epochs}] LR={current_lr:.2e} "
                   f"Train Loss: {avg_train_loss:.4f} | Train Dice: {avg_train_dice:.4f} "
                   f"| Val Loss: {avg_val_loss:.4f} | Val Dice: {avg_val_dice:.4f}"
-                #   f"训练时长: {consume_times/60} 分 {consume_times%60:.2f} 秒"
                   f"  训练时长: {consume_times:.2f} 秒")
 
             # 写入日志文件
@@ -344,7 +412,8 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default='./output')
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=1000)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-2,
+                        help="初始学习率 (默认 1e-2, 对标 nnUNet)")
     parser.add_argument("--num_workers", type=int, default=4,
                         help="DataLoader 进程数 (默认 4, 旧管线用 0)")
     parser.add_argument("--checkpoint_path", type=str, default=None)
@@ -371,6 +440,8 @@ if __name__ == "__main__":
                         help="GenSurfLoss 稳定后的权重 (默认 0.5)")
     parser.add_argument("--dtm_warmup", type=int, default=250,
                         help="多少 epoch 后开始加入 GenSurfLoss (默认 250)")
+    parser.add_argument("--num_iterations_per_epoch", type=int, default=250,
+                        help="每 epoch 训练迭代次数 (默认 250, 对标 nnUNet)")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -406,6 +477,7 @@ if __name__ == "__main__":
         dtm_loss=args.dtm_loss,
         dtm_weight=args.dtm_weight,
         dtm_warmup=args.dtm_warmup,
+        num_iterations_per_epoch=args.num_iterations_per_epoch,
     )
 
 

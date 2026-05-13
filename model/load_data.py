@@ -404,8 +404,8 @@ class StentDatasetV2(torch.utils.data.Dataset):
 
         data_patch = np.expand_dims(data_patch, axis=0)
 
-        data_tensor = torch.from_numpy(data_patch.copy()).float()
-        seg_tensor = torch.from_numpy(seg_patch.copy()).float()
+        data_tensor = torch.from_numpy(data_patch).float()
+        seg_tensor = torch.from_numpy(seg_patch).float()
 
         if self.transform is not None:
             data_dict = {'image': data_tensor, 'segmentation': seg_tensor}
